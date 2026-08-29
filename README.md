@@ -1,5 +1,7 @@
 # procmon
 
+<img width="737" height="831" alt="imagen" src="https://github.com/user-attachments/assets/3223b3db-e60b-460e-99ad-3102a5edac6a" />
+
 **procmon** es una pequeña herramienta de monitoreo de procesos para Linux, desarrollada en **Bash** y construida directamente sobre la información que expone el kernel mediante el sistema de archivos `/proc`.
 
 El proyecto se encuentra actualmente **en desarrollo** y forma parte de un taller práctico sobre procesos y planificación de CPU en Linux.
