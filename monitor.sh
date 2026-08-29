@@ -3,11 +3,16 @@
 # ---------------------------------------------------------
 # Guardamos la configuración actual de la terminal para
 # poder restaurarla exactamente como estaba al salir.
+# Si no hay una tty real (ej. se ejecuta en background o con
+# la salida redirigida), simplemente lo omitimos.
 # ---------------------------------------------------------
-old_stty=$(stty -g)
+have_tty=true
+old_stty=$(stty -g 2>/dev/null) || have_tty=false
 
 cleanup() {
-    stty "$old_stty"   # restaurar teclado (echo, modo canónico, etc.)
+    if [ "$have_tty" = true ]; then
+        stty "$old_stty" 2>/dev/null   # restaurar teclado (echo, modo canónico, etc.)
+    fi
     tput cnorm         # mostrar cursor de nuevo
     tput rmcup         # volver a la pantalla original de la terminal
     exit 0
@@ -23,7 +28,9 @@ trap cleanup SIGINT SIGTERM EXIT
 # Así, si el usuario scrollea o pulsa flechas, las secuencias
 # de escape (^[[B, ^[[A, etc.) NUNCA llegan a imprimirse.
 # ---------------------------------------------------------
-stty -echo -icanon min 0 time 0
+if [ "$have_tty" = true ]; then
+    stty -echo -icanon min 0 time 0
+fi
 
 tput smcup   # entrar a la pantalla alternativa (como vim/less/htop)
 tput civis   # ocultar el cursor
@@ -105,10 +112,23 @@ draw_line "Refreshing every 1 second • Press Ctrl+C to exit"
 draw_border
 
 # ---------------------------------------------------------
-# Bucle principal: SOLO redibuja la zona de procesos.
-# Cualquier tecla/escape que haya llegado se descarta antes
-# de redibujar, para que no se cuele nada residual.
+# Guardamos el tiempo de CPU de la lectura anterior de cada
+# PID, para calcular cuánto CPU consumió en el último segundo
+# (delta), que es lo que se usa para ordenar y para el %CPU.
+#
+# clk_tck = "ticks" de CPU por segundo que usa el kernel para
+# medir utime/stime en /proc/[pid]/stat (normalmente 100).
+# %CPU real = (delta_ticks / (segundos_transcurridos * clk_tck)) * 100
+#
+# prev_now guarda el instante exacto (con decimales) de la
+# lectura anterior, para no asumir que pasó "1 segundo" justo
+# -el sleep + el tiempo de procesamiento nunca es exacto-.
 # ---------------------------------------------------------
+declare -A prev_time
+clk_tck=$(getconf CLK_TCK 2>/dev/null)
+[ -z "$clk_tck" ] && clk_tck=100
+prev_now=""
+
 while true; do
 
     # Descartar cualquier entrada pendiente (flechas, scroll, etc.)
@@ -116,14 +136,20 @@ while true; do
         read -r -n 1 _ 2>/dev/null
     done
 
-    tput cup "$process_start_row" 0
+    now=$(date +%s.%N)
+    if [ -n "$prev_now" ]; then
+        elapsed=$(awk -v a="$now" -v b="$prev_now" 'BEGIN{d=a-b; if (d<=0) d=1; printf "%.6f", d}')
+    else
+        elapsed=1
+    fi
+    elapsed_ticks=$(awk -v e="$elapsed" -v c="$clk_tck" 'BEGIN{printf "%.6f", e*c}')
+    prev_now=$now
 
-    printed=0
+    # -------------------------------------------------------
+    # 1) Recolectar todos los procesos con su delta de CPU
+    # -------------------------------------------------------
+    rows=()
     for dir in /proc/[0-9]*/; do
-
-        if [ "$printed" -ge "$process_area_rows" ]; then
-            break
-        fi
 
         pid="${dir#/proc/}"
         pid="${pid%/}"
@@ -135,17 +161,49 @@ while true; do
 
         cpu=$(awk '{print $39}' "$dir/stat" 2>/dev/null)
         proc_time=$(awk '{print $14 + $15}' "$dir/stat" 2>/dev/null)
+        [ -z "$proc_time" ] && continue
+
+        last="${prev_time[$pid]:-$proc_time}"
+        delta=$((proc_time - last))
+        [ "$delta" -lt 0 ] && delta=0
+
+        prev_time[$pid]=$proc_time
+
+        # %CPU real: ticks consumidos / ticks disponibles en el intervalo
+        percent=$(awk -v d="$delta" -v et="$elapsed_ticks" \
+            'BEGIN{ if (et<=0) et=1; printf "%.1f", (d/et)*100 }')
 
         row=$(printf "%s %s %s %s %s" \
             "$(field "$pid" "$pid_width")" \
             "$(field "$name" "$process_width")" \
             "$(field "$state" "$state_width")" \
             "$(field "$cpu" "$cpu_width")" \
-            "$(field "$proc_time" "$percent_width")")
-        draw_line "$row"
+            "$(field "${percent}%" "$percent_width")")
 
-        printed=$((printed + 1))
+        # delta al frente (separado con tab) solo para poder ordenar
+        rows+=("$delta"$'\t'"$row")
     done
+
+    # -------------------------------------------------------
+    # 2) Limpiar del historial los PIDs que ya no existen
+    #    (evita que el arreglo crezca sin límite)
+    # -------------------------------------------------------
+    for pid in "${!prev_time[@]}"; do
+        [ -d "/proc/$pid" ] || unset 'prev_time[$pid]'
+    done
+
+    # -------------------------------------------------------
+    # 3) Ordenar por delta de CPU descendente y quedarnos con
+    #    los que caben en la pantalla
+    # -------------------------------------------------------
+    tput cup "$process_start_row" 0
+
+    printed=0
+    while IFS=$'\t' read -r _delta row; do
+        [ "$printed" -ge "$process_area_rows" ] && break
+        draw_line "$row"
+        printed=$((printed + 1))
+    done < <(printf '%s\n' "${rows[@]}" | sort -t$'\t' -k1,1 -rn)
 
     while [ "$printed" -lt "$process_area_rows" ]; do
         draw_line ""
